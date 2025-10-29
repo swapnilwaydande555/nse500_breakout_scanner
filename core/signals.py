@@ -1,6 +1,11 @@
-import os, json, time
+# core/signals.py
+# NSE-first data fetcher (public endpoints) with yfinance fallback.
+# Produces signals.json and appends history to signals_history.csv
+
+import os, json, math, time
 import pandas as pd
 import numpy as np
+import requests
 import yfinance as yf
 from ta.trend import SMAIndicator, EMAIndicator, MACD
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -12,23 +17,69 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SIGNALS_FILE = os.path.join(DATA_DIR, 'signals.json')
 HISTORY_FILE = os.path.join(DATA_DIR, 'signals_history.csv')
 
-# Expanded sample list (common NSE tickers in Yahoo format)
+# Small sample of NSE tickers; expand later to NSE-500 symbols.
 SAMPLE_SYMBOLS = ['RELIANCE.NS','TCS.NS','INFY.NS','HDFCBANK.NS','ICICIBANK.NS']
 
-def fetch_ohlcv(symbol, period='2y', interval='1d'):
-    # Helper wrapper around yfinance
+# Browser-like headers for NSE site
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+}
+
+def fetch_ohlcv_nse(symbol, days=365):
+    """
+    Try NSE public historical endpoint. If it fails, fall back to yfinance.
+    Returns DataFrame with columns Open,High,Low,Close,Volume indexed by Date.
+    """
+    nse_sym = symbol.split('.')[0]  # 'RELIANCE.NS' -> 'RELIANCE'
+    session = requests.Session()
+    session.headers.update(HEADERS)
     try:
-        df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
+        # Hit homepage to obtain cookies
+        session.get('https://www.nseindia.com', timeout=10)
+        to_date = datetime.utcnow().date()
+        from_date = to_date - timedelta(days=days)
+        url = (
+            'https://www.nseindia.com/api/historical/cm/equity'
+            f'?symbol={nse_sym}&series=[%22EQ%22]&from={from_date.strftime("%d-%m-%Y")}&to={to_date.strftime("%d-%m-%Y")}'
+        )
+        r = session.get(url, timeout=15)
+        if r.status_code != 200:
+            # fallback
+            return fetch_ohlcv_yf(symbol, days)
+        data = r.json()
+        if 'data' not in data or not data['data']:
+            return fetch_ohlcv_yf(symbol, days)
+        rows = data['data']
+        df = pd.DataFrame(rows)
+        # Normalize NSE fields -> Date, Open, High, Low, Close, Volume
+        # NSE date format like '30-Sep-2025'
+        df = df.rename(columns={
+            'CH_TIMESTAMP':'Date','OPEN':'Open','HIGH':'High','LOW':'Low','CLOSE':'Close','TOTTRDQTY':'Volume'
+        })
+        df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
+        df = df.dropna(subset=['Date']).set_index('Date').sort_index()
+        df = df[['Open','High','Low','Close','Volume']].astype(float)
+        return df
+    except Exception as e:
+        # Fallback to Yahoo
+        print('NSE fetch failed, falling back to yfinance:', e)
+        return fetch_ohlcv_yf(symbol, days)
+
+def fetch_ohlcv_yf(symbol, days=365):
+    try:
+        period = '1y' if days <= 365 else f'{math.ceil(days/365)}y'
+        df = yf.download(symbol, period=period, interval='1d', progress=False, threads=False)
         if df is None or df.empty:
             return None
         df = df.dropna()
-        return df
+        return df[['Open','High','Low','Close','Volume']]
     except Exception as e:
-        print('yfinance error', e)
+        print('yfinance fetch failed', e)
         return None
 
 def compute_indicators(df):
-    # requires df with Open High Low Close Volume and datetime index
     df = df.copy()
     df['sma20'] = SMAIndicator(df['Close'], window=20).sma_indicator()
     df['sma50'] = SMAIndicator(df['Close'], window=50).sma_indicator()
@@ -42,27 +93,24 @@ def compute_indicators(df):
     bb = BollingerBands(df['Close'], window=20, window_dev=2)
     df['bb_h'] = bb.bollinger_hband()
     df['bb_l'] = bb.bollinger_lband()
-    # Simple VWAP-like: cumulative typical price * vol / cumulative vol for window
     tp = (df['High'] + df['Low'] + df['Close'])/3
     df['vwap_20'] = (tp * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
     return df
 
-def multi_timeframe_checks(symbol):
-    # fetch daily and weekly, compute indicators and check breakout on both
-    daily = fetch_ohlcv(symbol, period='1y', interval='1d')
-    weekly = fetch_ohlcv(symbol, period='3y', interval='1wk')
-    if daily is None or weekly is None:
-        return None
-    daily = compute_indicators(daily)
-    weekly = compute_indicators(weekly)
-    return daily, weekly
-
 def analyze_symbol(symbol):
+    # Fetch daily (1y) and weekly (3y) using NSE first
+    daily = fetch_ohlcv_nse(symbol, days=365)
+    weekly = fetch_ohlcv_nse(symbol, days=3*365)
+    if daily is None or daily.empty:
+        return None
     try:
-        daily, weekly = multi_timeframe_checks(symbol)
-        if daily is None or weekly is None:
-            return None
-        # Last rows
+        daily = compute_indicators(daily)
+        # If weekly fetch returned daily-level data, resample weekly
+        if weekly is not None and not weekly.empty:
+            weekly = compute_indicators(weekly)
+        else:
+            weekly = compute_indicators(daily.resample('W').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}))
+
         d_latest = daily.iloc[-1]
         d_prev = daily.iloc[-2]
         w_latest = weekly.iloc[-1]
@@ -70,27 +118,24 @@ def analyze_symbol(symbol):
 
         reasons = []
         confidence = 0.0
-        action = None
-        # Breakout rules: daily close > previous daily high AND weekly close > previous weekly high
+
+        # Breakout/momentum checks
         daily_break = d_latest['Close'] > d_prev['High']
         weekly_break = w_latest['Close'] > w_prev['High']
-        # Momentum checks
         rsi_ok = d_latest['rsi14'] > 55
         macd_ok = d_latest['macd'] > d_latest['macd_signal']
         ema_trend = d_latest['ema20'] > d_latest['ema50']
-        vwap_ok = d_latest['Close'] > d_latest['vwap_20'] if not pd.isna(d_latest['vwap_20']) else True
-        # Volume confirmation
+        vwap_ok = (not pd.isna(d_latest['vwap_20'])) and (d_latest['Close'] > d_latest['vwap_20'])
         vol20 = daily['Volume'].rolling(20).mean().iloc[-1] if 'Volume' in daily.columns else 0
         vol_ok = False
-        if vol20>0 and d_latest['Volume'] > 1.2*vol20:
+        if vol20 > 0 and d_latest['Volume'] > 1.2*vol20:
             vol_ok = True
 
-        # Decide action and confidence
         if daily_break:
-            reasons.append('Daily breakout: close > prev high')
+            reasons.append('Daily breakout')
             confidence += 0.2
         if weekly_break:
-            reasons.append('Weekly breakout: weekly close > prev weekly high')
+            reasons.append('Weekly breakout')
             confidence += 0.35
         if rsi_ok:
             reasons.append('RSI>55')
@@ -99,83 +144,56 @@ def analyze_symbol(symbol):
             reasons.append('MACD positive')
             confidence += 0.1
         if ema_trend:
-            reasons.append('EMA20>EMA50 (uptrend)')
+            reasons.append('EMA trend up')
             confidence += 0.1
         if vwap_ok:
-            reasons.append('Price above 20-day VWAP')
+            reasons.append('Above VWAP')
             confidence += 0.05
         if vol_ok:
-            reasons.append('Volume confirmed (20-day avg surge)')
+            reasons.append('Volume surge')
             confidence += 0.15
         else:
-            reasons.append('Volume not sufficiently high — check for fakeout')
+            reasons.append('Volume low - watch fakeout')
             confidence -= 0.1
 
-        # Determine action
-        if confidence >= 0.5:
-            action = 'BUY'
-        else:
-            return None  # not strong enough
-
-        # Fake breakout detector: if close reversed strongly next bar recently, mark lower confidence
-        # (We approximate by checking last 3-day return)
-        recent_ret = (daily['Close'].pct_change().iloc[-3:]).sum()
-        if recent_ret < -0.05:
-            reasons.append('Recent negative momentum; possible reversal')
-            confidence -= 0.15
-
-        confidence = max(0.0, min(1.0, confidence))
+        if confidence < 0.5:
+            return None
 
         # Price levels
         buy_price = round(d_latest['Close'] * 1.001, 2)
-        atr = d_latest['atr14'] if not pd.isna(d_latest['atr14']) else (daily['Close'].pct_change().std()*d_latest['Close'])
+        atr = d_latest['atr14'] if not pd.isna(d_latest['atr14']) else (daily['Close'].pct_change().std() * d_latest['Close'])
         stoploss = round(d_latest['Close'] - 2*atr, 2)
         target = round(d_latest['Close'] + 3*atr, 2)
 
-        # Holding duration estimator (rule-based with clear explanation)
-        holding = 'Short (minutes-hours)'  # default, though minutes require intraday data; we will provide days when daily signal
-        holding_reason = ''
-        # If weekly_break and strong momentum -> Long
+        # Holding duration rules
         if weekly_break and confidence > 0.7:
             holding = 'Long (1-6 months)'
-            holding_reason = 'Weekly breakout + strong momentum historically persists'
+            holding_reason = 'Weekly breakout with strong momentum'
         elif confidence > 0.8 and ema_trend and macd_ok:
             holding = 'Medium (1-4 weeks)'
-            holding_reason = 'High confidence, trend aligned across indicators'
+            holding_reason = 'High confidence and trend alignment'
         else:
             holding = 'Short (2-7 days)'
-            holding_reason = 'Moderate confidence; prefer short review period'
+            holding_reason = 'Moderate confidence - prefer quick review'
 
-        result = {
+        signal = {
             'symbol': symbol,
             'timeframe': 'Daily/Weekly',
             'signal_time': datetime.utcnow().isoformat(),
-            'action': action,
+            'action': 'BUY',
             'buy_price': buy_price,
             'stoploss': stoploss,
             'target': target,
             'holding_duration': holding,
             'holding_reason': holding_reason,
-            'confidence': round(float(confidence),2),
+            'confidence': round(float(confidence), 2),
             'reasons': '; '.join(reasons)
         }
-        # Append to history CSV
-        _append_history(result)
-        return result
+        _append_history(signal)
+        return signal
     except Exception as e:
-        print('analyze_symbol error', e)
+        print('analyze_symbol exception', e)
         return None
-
-def _append_history(signal):
-    import csv, os
-    fields = ['symbol','timeframe','signal_time','action','buy_price','stoploss','target','holding_duration','holding_reason','confidence','reasons']
-    write_header = not os.path.exists(HISTORY_FILE)
-    with open(HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
-        import csv
-        w = csv.DictWriter(f, fieldnames=fields)
-        if write_header:
-            w.writeheader()
-        w.writerow({k:signal.get(k,'') for k in fields})
 
 def compute_and_store_signals():
     signals = []
@@ -187,7 +205,7 @@ def compute_and_store_signals():
         except Exception as e:
             print('Error analyzing', sym, e)
     with open(SIGNALS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(signals, f, default=str, indent=2)
+        json.dump(signals, f, indent=2, default=str)
     return signals
 
 def load_latest_signals():
@@ -196,24 +214,12 @@ def load_latest_signals():
     with open(SIGNALS_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def generate_signals_sample():
-    # Keep as compatibility helper
-    s = []
-    now = datetime.utcnow().isoformat()
-    for sym in SAMPLE_SYMBOLS:
-        s.append({
-            'symbol': sym,
-            'timeframe': 'Daily/Weekly',
-            'signal_time': now,
-            'action': 'BUY',
-            'buy_price': 100.0,
-            'stoploss': 95.0,
-            'target': 110.0,
-            'holding_duration': 'Medium (1-4 weeks)',
-            'holding_reason': 'Demo sample',
-            'confidence': 0.78,
-            'reasons': 'Sample generated'
-        })
-    with open(SIGNALS_FILE,'w', encoding='utf-8') as f:
-        json.dump(s,f,indent=2)
-    return s
+def _append_history(signal):
+    import csv
+    fields = ['symbol','timeframe','signal_time','action','buy_price','stoploss','target','holding_duration','holding_reason','confidence','reasons']
+    write_header = not os.path.exists(HISTORY_FILE)
+    with open(HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        if write_header:
+            w.writeheader()
+        w.writerow({k:signal.get(k,'') for k in fields})
