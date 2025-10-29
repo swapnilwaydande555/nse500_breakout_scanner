@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: nse500-breakout
+    env: docker
+    plan: free
+    repo: https://github.com/<your-username>/nse500_breakout_scanner
+    branch: main
+    dockerfilePath: ./Dockerfile
+  - type: worker
+    name: nse500-worker
+    env: docker
+    plan: free
+    repo: https://github.com/<your-username>/nse500_breakout_scanner
+    branch: main
+    dockerfilePath: ./Dockerfile
+    startCommand: python scheduler.py
