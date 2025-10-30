@@ -1,307 +1,124 @@
-# core/signals.py
-# Data pipeline: Alpha Vantage (preferred, free key) -> NSE public -> yfinance fallback
-# Breakout detection + indicators + holding-duration + sample generator
-
-import os
-import json
-import math
-import time
-import requests
+# app.py - Diagnostics-enabled version
+import streamlit as st
 import pandas as pd
-import numpy as np
-import yfinance as yf
-from datetime import datetime, timedelta
+import time
+import traceback
 
-# TA imports
-from ta.trend import SMAIndicator, EMAIndicator, MACD
-from ta.volatility import AverageTrueRange, BollingerBands
-from ta.momentum import RSIIndicator
+st.set_page_config(page_title="NSE500 Breakout Scanner (Diagnostics)", layout="wide")
 
-# Paths
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-SIGNALS_FILE = os.path.join(DATA_DIR, "signals.json")
-HISTORY_FILE = os.path.join(DATA_DIR, "signals_history.csv")
+# Safe imports
+try:
+    from core.signals import (
+        load_latest_signals,
+        compute_and_store_signals,
+        generate_signals_sample,
+    )
+    from core.signals import SAMPLE_SYMBOLS  # sample list
+    from core.signals import fetch_ohlcv, fetch_ohlcv_av, fetch_ohlcv_nse, fetch_ohlcv_yf
+    from alerts.telegram_alerts import send_test_alert
+except Exception as e:
+    st.title("🚨 Import Error — App couldn't start")
+    st.error("A required module failed to load. Full exception:")
+    st.exception(e)
+    st.stop()
 
-# small sample tickers (Yahoo format). Replace/expand later with NSE500 list.
-SAMPLE_SYMBOLS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
+st.title("📊 NSE-500 Breakout Scanner (Diagnostics)")
 
-# Optional Alpha Vantage key: set as environment variable ALPHA_VANTAGE_KEY on Streamlit
-ALPHA_KEY = os.getenv("ALPHA_VANTAGE_KEY", "").strip()
+col1, col2 = st.columns([3, 1])
 
-# NSE headers for fallback
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-# ------------------ Data fetchers ------------------
-def fetch_ohlcv_av(symbol, days=365):
-    """Fetch daily OHLC from Alpha Vantage (TIME_SERIES_DAILY_ADJUSTED)."""
-    if not ALPHA_KEY:
-        return None
-    # Alpha Vantage expects symbol exchange-less; we will pass raw symbol but with '.NS' removed for Indian tickers.
-    base_sym = symbol.split(".")[0]
-    url = ("https://www.alphavantage.co/query"
-           "?function=TIME_SERIES_DAILY_ADJUSTED"
-           f"&symbol={base_sym}.BSE"  # try BSE suffix first (Alpha V does not consistently support .NS)
-           f"&outputsize=full&apikey={ALPHA_KEY}")
-    # Try with .NS if BSE doesn't work
-    r = None
-    try:
-        r = requests.get(url, timeout=15)
-        data = r.json()
-        if "Time Series (Daily)" not in data:
-            # fallback attempt: try just base_sym (many IN tickers are available without suffix)
-            url2 = ("https://www.alphavantage.co/query"
-                    "?function=TIME_SERIES_DAILY_ADJUSTED"
-                    f"&symbol={base_sym}"
-                    f"&outputsize=full&apikey={ALPHA_KEY}")
-            r2 = requests.get(url2, timeout=15)
-            data = r2.json()
-            if "Time Series (Daily)" not in data:
-                return None
-        ts = data["Time Series (Daily)"]
-        records = []
-        cutoff = datetime.utcnow().date() - timedelta(days=days)
-        for d, vals in ts.items():
-            dt = datetime.strptime(d, "%Y-%m-%d").date()
-            if dt < cutoff:
-                continue
-            o = float(vals["1. open"])
-            h = float(vals["2. high"])
-            l = float(vals["3. low"])
-            c = float(vals["4. close"])
-            v = float(vals.get("6. volume", vals.get("5. volume", 0)))
-            records.append({"Date": pd.to_datetime(d), "Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
-        if not records:
-            return None
-        df = pd.DataFrame(records).set_index("Date").sort_index()
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception:
-        return None
-
-def fetch_ohlcv_nse(symbol, days=365):
-    """NSE public endpoint fallback."""
-    nse_sym = symbol.split(".")[0]
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        session.get("https://www.nseindia.com", timeout=10)
-        to_date = datetime.utcnow().date()
-        from_date = to_date - timedelta(days=days)
-        url = (
-            "https://www.nseindia.com/api/historical/cm/equity"
-            f"?symbol={nse_sym}&series=[%22EQ%22]&from={from_date.strftime('%d-%m-%Y')}&to={to_date.strftime('%d-%m-%Y')}"
-        )
-        r = session.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if "data" not in data or not data["data"]:
-            return None
-        rows = data["data"]
-        df = pd.DataFrame(rows)
-        df = df.rename(columns={"CH_TIMESTAMP": "Date", "OPEN": "Open", "HIGH": "High", "LOW": "Low", "CLOSE": "Close", "TOTTRDQTY": "Volume"})
-        df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
-        return df
-    except Exception:
-        return None
-
-def fetch_ohlcv_yf(symbol, days=365):
-    """Yahoo Finance fallback via yfinance"""
-    try:
-        period = "1y" if days <= 365 else f"{math.ceil(days/365)}y"
-        df = yf.download(symbol, period=period, interval="1d", progress=False, threads=False)
-        if df is None or df.empty:
-            return None
-        df = df.dropna()
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception:
-        return None
-
-def fetch_ohlcv(symbol, days=365):
-    """Master fetch with AV -> NSE -> Yahoo fallback."""
-    # 1) Alpha Vantage (if key provided)
-    df = None
-    if ALPHA_KEY:
-        df = fetch_ohlcv_av(symbol, days=days)
-        if df is not None and not df.empty:
-            return df
-    # 2) NSE
-    df = fetch_ohlcv_nse(symbol, days=days)
-    if df is not None and not df.empty:
-        return df
-    # 3) yfinance
-    return fetch_ohlcv_yf(symbol, days=days)
-
-# ------------------ Indicators ------------------
-def compute_indicators(df):
-    df = df.copy()
-    df["sma20"] = SMAIndicator(df["Close"], window=20).sma_indicator()
-    df["sma50"] = SMAIndicator(df["Close"], window=50).sma_indicator()
-    df["ema20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
-    df["ema50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
-    macd = MACD(df["Close"])
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["rsi14"] = RSIIndicator(df["Close"], window=14).rsi()
-    df["atr14"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
-    bb = BollingerBands(df["Close"], window=20, window_dev=2)
-    df["bb_h"] = bb.bollinger_hband()
-    df["bb_l"] = bb.bollinger_lband()
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    df["vwap_20"] = (tp * df["Volume"]).rolling(20).sum() / df["Volume"].rolling(20).sum()
-    return df
-
-# ------------------ Analysis ------------------
-def analyze_symbol(symbol):
-    daily = fetch_ohlcv(symbol, days=365)
-    if daily is None or daily.empty:
-        return None
-    # weekly: try fetch 3 years, if not available, resample
-    weekly = fetch_ohlcv(symbol, days=3*365)
-    try:
-        daily = compute_indicators(daily)
-        if weekly is not None and not weekly.empty:
-            weekly = compute_indicators(weekly)
-        else:
-            weekly = compute_indicators(daily.resample("W").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}))
-
-        d_latest = daily.iloc[-1]
-        d_prev = daily.iloc[-2]
-        w_latest = weekly.iloc[-1]
-        w_prev = weekly.iloc[-2]
-
-        reasons = []
-        confidence = 0.0
-
-        # breakout and momentum checks
-        daily_break = d_latest["Close"] > d_prev["High"]
-        weekly_break = w_latest["Close"] > w_prev["High"]
-        rsi_ok = d_latest["rsi14"] > 55
-        macd_ok = d_latest["macd"] > d_latest["macd_signal"]
-        ema_trend = d_latest["ema20"] > d_latest["ema50"]
-        vwap_ok = (not pd.isna(d_latest["vwap_20"])) and (d_latest["Close"] > d_latest["vwap_20"])
-
-        vol20 = daily["Volume"].rolling(20).mean().iloc[-1] if "Volume" in daily.columns else 0
-        vol_ok = False
-        if vol20 > 0 and d_latest["Volume"] > 1.2 * vol20:
-            vol_ok = True
-
-        if daily_break:
-            reasons.append("Daily breakout")
-            confidence += 0.2
-        if weekly_break:
-            reasons.append("Weekly breakout")
-            confidence += 0.35
-        if rsi_ok:
-            reasons.append("RSI>55")
-            confidence += 0.15
-        if macd_ok:
-            reasons.append("MACD positive")
-            confidence += 0.1
-        if ema_trend:
-            reasons.append("EMA trend up")
-            confidence += 0.1
-        if vwap_ok:
-            reasons.append("Above VWAP")
-            confidence += 0.05
-        if vol_ok:
-            reasons.append("Volume surge")
-            confidence += 0.15
-        else:
-            reasons.append("Volume low - watch fakeout")
-            confidence -= 0.1
-
-        if confidence < 0.5:
-            return None
-
-        buy_price = round(d_latest["Close"] * 1.001, 2)
-        atr = d_latest["atr14"] if not pd.isna(d_latest["atr14"]) else (daily["Close"].pct_change().std() * d_latest["Close"])
-        stoploss = round(d_latest["Close"] - 2 * atr, 2)
-        target = round(d_latest["Close"] + 3 * atr, 2)
-
-        if weekly_break and confidence > 0.7:
-            holding = "Long (1-6 months)"
-            holding_reason = "Weekly breakout with strong momentum"
-        elif confidence > 0.8 and ema_trend and macd_ok:
-            holding = "Medium (1-4 weeks)"
-            holding_reason = "High confidence and trend alignment"
-        else:
-            holding = "Short (2-7 days)"
-            holding_reason = "Moderate confidence - prefer quick review"
-
-        signal = {
-            "symbol": symbol,
-            "timeframe": "Daily/Weekly",
-            "signal_time": datetime.utcnow().isoformat(),
-            "action": "BUY",
-            "buy_price": buy_price,
-            "stoploss": stoploss,
-            "target": target,
-            "holding_duration": holding,
-            "holding_reason": holding_reason,
-            "confidence": round(float(confidence), 2),
-            "reasons": "; ".join(reasons),
-        }
-        _append_history(signal)
-        return signal
-    except Exception:
-        return None
-
-# ------------------ Bulk compute & persistence ------------------
-def compute_and_store_signals():
-    signals = []
-    for sym in SAMPLE_SYMBOLS:
+with col2:
+    st.markdown("### ⚙️ Admin")
+    if st.button("Generate sample signals (debug)"):
+        generate_signals_sample()
+        st.success("Sample signals generated. Refresh the page to view them.")
+    if st.button("Force compute signals now"):
         try:
-            r = analyze_symbol(sym)
-            if r:
-                signals.append(r)
-        except Exception:
-            continue
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(signals, f, indent=2, default=str)
-    return signals
+            compute_and_store_signals()
+            st.success("✅ Signals computed. Refresh the page.")
+        except Exception as e:
+            st.error("Computation failed:")
+            st.exception(e)
+    if st.button("Send test Telegram Alert"):
+        resp = send_test_alert("This is a test alert from your NSE500 Scanner.")
+        st.write(resp)
 
-def load_latest_signals():
-    if not os.path.exists(SIGNALS_FILE):
-        return None
-    with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    st.markdown("---")
+    st.markdown("### 🔎 Diagnostics")
+    st.markdown("Use **Run Diagnostics** to see which data source returns rows for each symbol.")
+    if st.button("Run Diagnostics"):
+        st.info("Running diagnostics — this may take up to 30 seconds (one request per sample symbol)...")
+        diag_results = []
+        for sym in SAMPLE_SYMBOLS:
+            row = {"symbol": sym, "alpha_rows": None, "nse_rows": None, "yf_rows": None, "alpha_err": None, "nse_err": None, "yf_err": None}
+            # Alpha Vantage (if available)
+            try:
+                av = None
+                try:
+                    av = fetch_ohlcv_av(sym, days=365)
+                except Exception as e_av:
+                    row["alpha_err"] = str(e_av)
+                if av is not None:
+                    row["alpha_rows"] = len(av)
+                # NSE
+                nse_df = None
+                try:
+                    nse_df = fetch_ohlcv_nse(sym, days=365)
+                except Exception as e_nse:
+                    row["nse_err"] = str(e_nse)
+                if nse_df is not None:
+                    row["nse_rows"] = len(nse_df)
+                # Yahoo
+                yf_df = None
+                try:
+                    yf_df = fetch_ohlcv_yf(sym, days=365)
+                except Exception as e_yf:
+                    row["yf_err"] = str(e_yf)
+                if yf_df is not None:
+                    row["yf_rows"] = len(yf_df)
+            except Exception as e_any:
+                row["diag_error"] = traceback.format_exc()
+            diag_results.append(row)
+        st.success("Diagnostics complete — see table below.")
+        st.dataframe(pd.DataFrame(diag_results))
+        st.markdown("**Notes:**")
+        st.markdown("- `alpha_rows` shows number of daily rows AlphaVantage returned (if key set).")
+        st.markdown("- `nse_rows` shows rows from NSE public endpoint.")
+        st.markdown("- `yf_rows` shows rows from yfinance fallback.")
+        st.markdown("- If all three columns are `None`, the fetcher failed for that symbol — copy the errors and paste them in chat for help.")
+        st.stop()
 
-# ------------------ Sample generator ------------------
-def generate_signals_sample():
-    s = []
-    now = datetime.utcnow().isoformat()
-    for sym in SAMPLE_SYMBOLS:
-        s.append({
-            "symbol": sym,
-            "timeframe": "Daily/Weekly",
-            "signal_time": now,
-            "action": "BUY",
-            "buy_price": round(100.0 + (hash(sym) % 50), 2),
-            "stoploss": round(95.0 + (hash(sym) % 10), 2),
-            "target": round(110.0 + (hash(sym) % 20), 2),
-            "holding_duration": "Medium (1-4 weeks)",
-            "holding_reason": "Demo sample",
-            "confidence": 0.78,
-            "reasons": "Sample generated"
-        })
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(s, f, indent=2)
-    return s
+with col1:
+    st.markdown("### 📈 Latest Signals")
+    try:
+        signals = load_latest_signals()
+    except Exception as e:
+        st.error("Couldn't load signals.json:")
+        st.exception(e)
+        signals = None
 
-# ------------------ History append ------------------
-def _append_history(signal):
-    import csv
-    fields = ["symbol","timeframe","signal_time","action","buy_price","stoploss","target","holding_duration","holding_reason","confidence","reasons"]
-    write_header = not os.path.exists(HISTORY_FILE)
-    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if write_header:
-            w.writeheader()
-        w.writerow({k: signal.get(k, "") for k in fields})
+    if not signals:
+        st.info(
+            "No signals yet. Click **Force compute signals now** to fetch live data "
+            "or **Generate sample signals** for demo output. Use Diagnostics to test sources."
+        )
+    else:
+        df = pd.DataFrame(signals)
+        display_cols = [
+            "symbol",
+            "timeframe",
+            "signal_time",
+            "action",
+            "buy_price",
+            "stoploss",
+            "target",
+            "holding_duration",
+            "holding_reason",
+            "confidence",
+            "reasons",
+        ]
+        df = df[[c for c in display_cols if c in df.columns]]
+        st.dataframe(df, use_container_width=True)
+
+st.markdown("---")
+st.caption("Diagnostics tool will show which data source returned rows. If AlphaVantage is preferred, set ALPHA_VANTAGE_KEY in Streamlit Secrets.")
+st.caption("Last updated: " + time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
