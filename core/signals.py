@@ -1,6 +1,6 @@
 # core/signals.py
-# Full file — NSE-first fetcher (with yfinance fallback), indicator computations,
-# multi-timeframe breakout rules, history writing, and a generate_signals_sample helper.
+# Data pipeline: Alpha Vantage (preferred, free key) -> NSE public -> yfinance fallback
+# Breakout detection + indicators + holding-duration + sample generator
 
 import os
 import json
@@ -12,34 +12,78 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-# TA imports (ta package)
+# TA imports
 from ta.trend import SMAIndicator, EMAIndicator, MACD
 from ta.volatility import AverageTrueRange, BollingerBands
 from ta.momentum import RSIIndicator
 
-# Data paths
+# Paths
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 SIGNALS_FILE = os.path.join(DATA_DIR, "signals.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "signals_history.csv")
 
-# Small sample list — expand later
+# small sample tickers (Yahoo format). Replace/expand later with NSE500 list.
 SAMPLE_SYMBOLS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
 
-# Browser-like headers for NSE
+# Optional Alpha Vantage key: set as environment variable ALPHA_VANTAGE_KEY on Streamlit
+ALPHA_KEY = os.getenv("ALPHA_VANTAGE_KEY", "").strip()
+
+# NSE headers for fallback
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# ------------------ Data fetchers ------------------
+def fetch_ohlcv_av(symbol, days=365):
+    """Fetch daily OHLC from Alpha Vantage (TIME_SERIES_DAILY_ADJUSTED)."""
+    if not ALPHA_KEY:
+        return None
+    # Alpha Vantage expects symbol exchange-less; we will pass raw symbol but with '.NS' removed for Indian tickers.
+    base_sym = symbol.split(".")[0]
+    url = ("https://www.alphavantage.co/query"
+           "?function=TIME_SERIES_DAILY_ADJUSTED"
+           f"&symbol={base_sym}.BSE"  # try BSE suffix first (Alpha V does not consistently support .NS)
+           f"&outputsize=full&apikey={ALPHA_KEY}")
+    # Try with .NS if BSE doesn't work
+    r = None
+    try:
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if "Time Series (Daily)" not in data:
+            # fallback attempt: try just base_sym (many IN tickers are available without suffix)
+            url2 = ("https://www.alphavantage.co/query"
+                    "?function=TIME_SERIES_DAILY_ADJUSTED"
+                    f"&symbol={base_sym}"
+                    f"&outputsize=full&apikey={ALPHA_KEY}")
+            r2 = requests.get(url2, timeout=15)
+            data = r2.json()
+            if "Time Series (Daily)" not in data:
+                return None
+        ts = data["Time Series (Daily)"]
+        records = []
+        cutoff = datetime.utcnow().date() - timedelta(days=days)
+        for d, vals in ts.items():
+            dt = datetime.strptime(d, "%Y-%m-%d").date()
+            if dt < cutoff:
+                continue
+            o = float(vals["1. open"])
+            h = float(vals["2. high"])
+            l = float(vals["3. low"])
+            c = float(vals["4. close"])
+            v = float(vals.get("6. volume", vals.get("5. volume", 0)))
+            records.append({"Date": pd.to_datetime(d), "Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
+        if not records:
+            return None
+        df = pd.DataFrame(records).set_index("Date").sort_index()
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception:
+        return None
 
-# ---------- Data fetchers ----------
 def fetch_ohlcv_nse(symbol, days=365):
-    """
-    Try NSE public historical endpoint. If it fails, fall back to yfinance.
-    Returns DataFrame with columns Open,High,Low,Close,Volume indexed by Date.
-    """
+    """NSE public endpoint fallback."""
     nse_sym = symbol.split(".")[0]
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -53,31 +97,22 @@ def fetch_ohlcv_nse(symbol, days=365):
         )
         r = session.get(url, timeout=15)
         if r.status_code != 200:
-            return fetch_ohlcv_yf(symbol, days)
+            return None
         data = r.json()
         if "data" not in data or not data["data"]:
-            return fetch_ohlcv_yf(symbol, days)
+            return None
         rows = data["data"]
         df = pd.DataFrame(rows)
-        df = df.rename(
-            columns={
-                "CH_TIMESTAMP": "Date",
-                "OPEN": "Open",
-                "HIGH": "High",
-                "LOW": "Low",
-                "CLOSE": "Close",
-                "TOTTRDQTY": "Volume",
-            }
-        )
+        df = df.rename(columns={"CH_TIMESTAMP": "Date", "OPEN": "Open", "HIGH": "High", "LOW": "Low", "CLOSE": "Close", "TOTTRDQTY": "Volume"})
         df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
         df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
         df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
         return df
     except Exception:
-        return fetch_ohlcv_yf(symbol, days)
-
+        return None
 
 def fetch_ohlcv_yf(symbol, days=365):
+    """Yahoo Finance fallback via yfinance"""
     try:
         period = "1y" if days <= 365 else f"{math.ceil(days/365)}y"
         df = yf.download(symbol, period=period, interval="1d", progress=False, threads=False)
@@ -88,8 +123,22 @@ def fetch_ohlcv_yf(symbol, days=365):
     except Exception:
         return None
 
+def fetch_ohlcv(symbol, days=365):
+    """Master fetch with AV -> NSE -> Yahoo fallback."""
+    # 1) Alpha Vantage (if key provided)
+    df = None
+    if ALPHA_KEY:
+        df = fetch_ohlcv_av(symbol, days=days)
+        if df is not None and not df.empty:
+            return df
+    # 2) NSE
+    df = fetch_ohlcv_nse(symbol, days=days)
+    if df is not None and not df.empty:
+        return df
+    # 3) yfinance
+    return fetch_ohlcv_yf(symbol, days=days)
 
-# ---------- Indicators ----------
+# ------------------ Indicators ------------------
 def compute_indicators(df):
     df = df.copy()
     df["sma20"] = SMAIndicator(df["Close"], window=20).sma_indicator()
@@ -108,20 +157,19 @@ def compute_indicators(df):
     df["vwap_20"] = (tp * df["Volume"]).rolling(20).sum() / df["Volume"].rolling(20).sum()
     return df
 
-
-# ---------- Analyzer ----------
+# ------------------ Analysis ------------------
 def analyze_symbol(symbol):
-    # daily = 1 year, weekly = 3 years (resampled if needed)
-    daily = fetch_ohlcv_nse(symbol, days=365)
+    daily = fetch_ohlcv(symbol, days=365)
     if daily is None or daily.empty:
         return None
-    weekly = fetch_ohlcv_nse(symbol, days=3 * 365)
+    # weekly: try fetch 3 years, if not available, resample
+    weekly = fetch_ohlcv(symbol, days=3*365)
     try:
         daily = compute_indicators(daily)
         if weekly is not None and not weekly.empty:
             weekly = compute_indicators(weekly)
         else:
-            weekly = compute_indicators(daily.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}))
+            weekly = compute_indicators(daily.resample("W").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}))
 
         d_latest = daily.iloc[-1]
         d_prev = daily.iloc[-2]
@@ -131,7 +179,7 @@ def analyze_symbol(symbol):
         reasons = []
         confidence = 0.0
 
-        # breakout/momentum checks
+        # breakout and momentum checks
         daily_break = d_latest["Close"] > d_prev["High"]
         weekly_break = w_latest["Close"] > w_prev["High"]
         rsi_ok = d_latest["rsi14"] > 55
@@ -200,15 +248,12 @@ def analyze_symbol(symbol):
             "confidence": round(float(confidence), 2),
             "reasons": "; ".join(reasons),
         }
-
         _append_history(signal)
         return signal
-
     except Exception:
         return None
 
-
-# ---------- Bulk compute / persistence ----------
+# ------------------ Bulk compute & persistence ------------------
 def compute_and_store_signals():
     signals = []
     for sym in SAMPLE_SYMBOLS:
@@ -222,44 +267,38 @@ def compute_and_store_signals():
         json.dump(signals, f, indent=2, default=str)
     return signals
 
-
 def load_latest_signals():
     if not os.path.exists(SIGNALS_FILE):
         return None
     with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
-# ---------- Sample generator (for the UI test button) ----------
+# ------------------ Sample generator ------------------
 def generate_signals_sample():
     s = []
     now = datetime.utcnow().isoformat()
     for sym in SAMPLE_SYMBOLS:
-        s.append(
-            {
-                "symbol": sym,
-                "timeframe": "Daily/Weekly",
-                "signal_time": now,
-                "action": "BUY",
-                "buy_price": round(100.0 + (hash(sym) % 50), 2),
-                "stoploss": round(95.0 + (hash(sym) % 10), 2),
-                "target": round(110.0 + (hash(sym) % 20), 2),
-                "holding_duration": "Medium (1-4 weeks)",
-                "holding_reason": "Demo sample",
-                "confidence": 0.78,
-                "reasons": "Sample generated",
-            }
-        )
+        s.append({
+            "symbol": sym,
+            "timeframe": "Daily/Weekly",
+            "signal_time": now,
+            "action": "BUY",
+            "buy_price": round(100.0 + (hash(sym) % 50), 2),
+            "stoploss": round(95.0 + (hash(sym) % 10), 2),
+            "target": round(110.0 + (hash(sym) % 20), 2),
+            "holding_duration": "Medium (1-4 weeks)",
+            "holding_reason": "Demo sample",
+            "confidence": 0.78,
+            "reasons": "Sample generated"
+        })
     with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
     return s
 
-
-# ---------- History append ----------
+# ------------------ History append ------------------
 def _append_history(signal):
     import csv
-
-    fields = ["symbol", "timeframe", "signal_time", "action", "buy_price", "stoploss", "target", "holding_duration", "holding_reason", "confidence", "reasons"]
+    fields = ["symbol","timeframe","signal_time","action","buy_price","stoploss","target","holding_duration","holding_reason","confidence","reasons"]
     write_header = not os.path.exists(HISTORY_FILE)
     with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
